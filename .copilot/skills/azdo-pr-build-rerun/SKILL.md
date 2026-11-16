@@ -1,139 +1,105 @@
 ---
 name: azdo-pr-build-rerun
-description: Use when a GitHub PR needs a new Azure DevOps (Azure Pipelines) run, including after a base-branch fix, changed inputs, or stale CI results. Prefer queueing a fresh PR validation build through a valid, logged-in Azure CLI with the azure-devops extension; use GitHub `/azp run` comments only when the CLI cannot perform that operation. Also applies to requests phrased as rerun or retry CI.
+description: Use when a GitHub PR needs new Azure Pipelines validation, including after a base-branch fix, changed inputs, or stale CI results, and for requests phrased as rerun or retry builds. Use an installed, authenticated GitHub CLI to re-request the provider's checks with an account permitted to rerun them; fall back to supported pipeline command comments only when direct re-requests cannot perform the operation.
 ---
 
-# New Azure DevOps pipeline runs for GitHub PRs
+# Request PR pipeline runs through GitHub CLI
 
-Use this skill whenever a GitHub PR needs a new Azure Pipelines run. Examples include a fix merged into the base branch that should make tests pass, changed pipeline inputs, stale checks, and requests phrased as "rerun the failed builds". GitHub Actions are out of scope.
+Use GitHub CLI (`gh`), not Azure CLI, to request Azure Pipelines builds from their GitHub PR checks. No Azure CLI, Azure DevOps extension, or Azure credentials are required. Keep the existing skill directory/name `azdo-pr-build-rerun` for in-place upgrades.
 
-**Default to a fresh build (a new build ID), not retrying jobs in an old build.** An existing-build retry preserves the old source revision and cannot pick up a base-branch fix. A fresh run must still be checked for the correct revision; neither the CLI nor `/azp run` guarantees that GitHub has refreshed a stale PR merge ref.
+The goal is new validation of the intended source and inputs, not merely resetting a check's status. Re-requesting a check asks its owning integration to run it; it does not let the caller choose a new commit, refresh a stale merge ref, or change pipeline inputs.
 
-The CLI-first preference applies to fresh runs too. Do not skip the CLI merely because the prior build succeeded, its revision is stale, or a job retry would not pick up the fix.
+Only act on pipelines within the user's requested scope. Do not update PR branches, cancel builds, modify workflows, install tools, or run login commands without authorization.
 
-Only start pipelines within the user's requested scope. Do not update PR branches, cancel running builds, change pipeline definitions, install extensions, or run login commands without authorization. Keep the skill directory/name `azdo-pr-build-rerun` so existing installations can be updated in place.
+## 1. Validate GitHub CLI and access
 
-## 1. Identify the Azure DevOps builds
-
-List the PR's checks and keep the ones whose link points to Azure DevOps:
+Use the PR's actual GitHub host, including on GitHub Enterprise:
 
 ```powershell
-gh pr checks <pr> --repo <owner>/<repo> --json name,state,bucket,link
+Get-Command gh -ErrorAction SilentlyContinue
+gh auth status --hostname <host>
+gh api --hostname <host> user --jq '.login'
+gh api --hostname <host> "repos/<owner>/<repo>" --jq '{full_name,permissions}'
 ```
 
-Azure Pipelines check links look like either of these:
+Check exit codes before consuming output. Authentication must work for the target host with the intended user; public read access alone is not proof of authentication or rerun permission. Never print tokens or use `gh auth token` to diagnose access.
 
-- `https://dev.azure.com/<org>/<project>/_build/results?buildId=<buildId>...`
-- `https://<org>.visualstudio.com/<project>/_build/results?buildId=<buildId>...`
+The user and token must have permission to rerun the selected checks. Repository write access is a useful preflight signal, not proof: token scopes, SSO, repository policy, and the check-owning integration can impose additional restrictions. Determine support and permission from the actual re-request response; do not assume that being the PR author grants access.
 
-From each link, extract:
+If `gh` is missing, authentication fails, or the account cannot perform any supported trigger, report the specific blocker. Do not silently switch users, install tools, obtain credentials, or revert to Azure CLI. A command-comment fallback also requires a working authenticated `gh` and permission to trigger that pipeline.
 
-- **Organization URL:** `https://dev.azure.com/<org>` (also for `<org>.visualstudio.com` links).
-- **Project:** the path segment before `/_build`. It may be a name or a GUID; both work.
-- **Build ID:** the `buildId` query parameter.
+## 2. Identify the selected checks
 
-URL-decode the project segment. Several checks can share one build ID; deduplicate them. Then resolve the pipeline definition from that build and queue at most once per organization/project/definition/PR. Do not assume each job check is a separate pipeline.
-
-Select pipelines by the user's requested outcome, not just the old build result. For "rerun failed builds", select failed or canceled pipelines. For "validate with the fix now in main", select the affected pipelines even if their old runs succeeded. Before queueing, check for an already queued/running build of the same pipeline and desired revision; do not create duplicates.
-
-## 2. Establish the source revision the new run needs
-
-Read the current PR and its merge ref from the PR's base repository, including for fork PRs:
+Read the current PR and its checks from the base repository, including for fork PRs:
 
 ```powershell
-gh api "repos/<owner>/<repo>/pulls/<pr>"
-gh api "repos/<owner>/<repo>/git/ref/pull/<pr>/merge" --jq '.object.sha'
+gh api --hostname <host> "repos/<owner>/<repo>/pulls/<pr>"
+gh pr checks <pr> --repo <host>/<owner>/<repo> --json name,state,bucket,link
+gh api --hostname <host> --paginate "repos/<owner>/<repo>/commits/<headSha>/check-runs?per_page=100"
 ```
 
-For normal GitHub PR validation, use `refs/pull/<pr>/merge` and its current SHA, not the old build's `sourceVersion`, the PR head SHA alone, or `refs/heads/main`. Confirm the merge commit's parents match the current PR head and base revisions. If the user identifies a merged fix, verify that the desired merge SHA contains it:
+`gh pr checks` can return a nonzero exit code because checks failed or are pending; distinguish that from an authentication or API error.
+
+Match checks using their name, owning `app`, `details_url`, `external_id`, and PR/revision context. Azure Pipelines links normally point to `dev.azure.com` or `<org>.visualstudio.com`. Record each selected check run's `id`, `check_suite.id`, `head_sha`, status, conclusion, and provider build link. If needed, also inspect checks on the verified merge SHA and legacy commit statuses; a status context is not a check run and cannot be re-requested through the Checks API.
+
+For "rerun failed builds", select the failed/canceled pipelines. For "validate with the fix now in main", select the affected pipelines even if old runs succeeded. Do not treat every job or analysis check as an independent pipeline.
+
+GitHub Actions workflow runs are different: use `gh run rerun <run-id> --repo <host>/<owner>/<repo>` (or `--failed` when requested) only for actual Actions runs, never for Azure build IDs or GitHub check IDs. Actions reruns reuse the original event's SHA/ref; they are not a way to pick up a newer base revision.
+
+## 3. Verify the source and avoid duplicate runs
+
+When a base-branch fix or newer source is required, resolve the current PR merge ref:
 
 ```powershell
-gh api "repos/<owner>/<repo>/commits/<mergeSha>" --jq '{sha,parents:[.parents[].sha]}'
-gh api "repos/<owner>/<repo>/compare/<fixSha>...<mergeSha>" --jq '{status,ahead_by,behind_by}'
+gh api --hostname <host> "repos/<owner>/<repo>/git/ref/pull/<pr>/merge" --jq '.object.sha'
+gh api --hostname <host> "repos/<owner>/<repo>/commits/<mergeSha>" --jq '{sha,parents:[.parents[].sha]}'
+gh api --hostname <host> "repos/<owner>/<repo>/compare/<fixSha>...<mergeSha>" --jq '{status,ahead_by,behind_by}'
 ```
 
-`ahead` or `identical` confirms fix ancestry; `behind` or `diverged` does not. If the merge ref is missing, conflicted, stale, or lacks the required fix, report the source-revision blocker. A branch update or merge-ref refresh may be needed; perform a branch update only if authorized. Re-read the refs after any update.
+Confirm the merge parents match the current PR head and base. `ahead` or `identical` confirms fix ancestry; `behind` or `diverged` does not. A stale, missing, or conflicted merge ref is a source blocker, not a reason to retry an old build or post a command comment. Update a PR branch only if authorized, then re-read the refs.
 
-Do not queue the known-old revision and claim it tests the fix. Switching to a command comment does not solve a stale merge ref. If the user explicitly wants a run of that old revision anyway, report that limitation.
+A check's `head_sha` may be the PR head even when the provider checks out the PR merge commit. Do not equate check association with the actual built revision. Establish the provider's checkout behavior from repository configuration, check output, or linked build evidence. If it will reuse an old revision, do not claim a re-request will test the fix. Changed pipeline inputs must also be confirmed; a re-request has no input-override payload.
 
-## 3. Validate the Azure CLI
+Re-read the PR and selected checks immediately before triggering. Skip an equivalent pending/running build for the desired revision/inputs; do not cancel an old active build without authorization. Deduplicate multiple checks that trigger the same pipeline. Save the original check IDs, timestamps, provider links, and available build IDs to distinguish a new run afterward.
 
-Check without prompting:
+## 4. Re-request through GitHub CLI (preferred)
 
-1. `az` is installed: `Get-Command az -ErrorAction SilentlyContinue`.
-2. The extension is installed: `az extension show --name azure-devops --query version -o tsv`.
-3. An existing Azure DevOps login, `AZURE_DEVOPS_EXT_PAT`, or Azure login is usable for the organization. For Azure login, check token acquisition without printing the token: `az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query expiresOn -o tsv`. Do not require an Azure subscription or this token check when using DevOps PAT authentication.
-4. Read the full original build to obtain its definition, repository, parameters, and PR trigger metadata:
-
-   ```powershell
-   az pipelines build show --id <buildId> --org <orgUrl> --project <project> -o json
-   ```
-
-Never print credentials or use `--debug` to inspect authentication. Anonymous read access to a public build is not proof of a valid login or queue permission. Check exit codes before consuming CLI output. Validate per organization; one organization failing does not invalidate another.
-
-Missing CLI/extension, invalid authentication, or denied access permits step 5. If reads succeed, attempt the CLI queue operation below; lack of queue permission must be established from an actual rejection, not inferred merely because PR validation is involved.
-
-## 4. Queue a fresh PR validation build through the CLI (preferred)
-
-Use the Build Queue REST API through `az devops invoke`. The convenience command `az pipelines build queue` cannot express all the PR metadata below; that is a reason to use `invoke`, not a reason to abandon the CLI.
-
-Construct a minimal queue request from the original PR validation build and the current PR:
-
-- Preserve `definition.id`, the GitHub `repository` identity, applicable `parameters`, `templateParameters`, and `triggerInfo`. Confirm the original build belongs to this PR and uses `reason: pullRequest`. Do not replay the entire build object, including its old ID, status, result, timestamps, or orchestration plans.
-- Set `reason` to `pullRequest`, `sourceBranch` to the verified PR merge ref, and `sourceVersion` to the verified current merge SHA.
-- Refresh existing PR metadata against the current PR, particularly `system.pullRequest.sourceCommitId` in the JSON-encoded `parameters` and `pr.sourceSha` in `triggerInfo` (both use the current PR **head** SHA, not the merge SHA). Also refresh PR IDs, number, head/base branch names, fork identity, and any revision-bearing metadata present. Preserve required pipeline inputs unless the user requested changes.
-- If the original build's PR context cannot be established or safely reconstructed, explain what is missing and use step 5. Do not invent metadata or mislabel a generic manual build as PR validation.
-
-Illustrative queue request, after resolving and validating `$original`, `$mergeRef`, `$mergeSha`, and refreshing `$parameters`/`$triggerInfo` as above:
+For the specific pipeline's trigger check, use its GitHub check-run ID:
 
 ```powershell
-$request = @{
-    definition = @{ id = $original.definition.id }
-    repository = $original.repository
-    reason = 'pullRequest'
-    sourceBranch = $mergeRef
-    sourceVersion = $mergeSha
-    triggerInfo = $triggerInfo
-}
-if ($null -ne $parameters) {
-    $request.parameters = ($parameters | ConvertTo-Json -Depth 20 -Compress)
-}
-if ($null -ne $original.templateParameters) {
-    $request.templateParameters = $original.templateParameters
-}
-$body = Join-Path $env:TEMP "azdo-queue-$([guid]::NewGuid()).json"
-try {
-    $json = $request | ConvertTo-Json -Depth 30
-    [System.IO.File]::WriteAllText($body, $json, [System.Text.UTF8Encoding]::new($false))
-    az devops invoke --org $orgUrl --area build --resource builds --route-parameters "project=$project" --http-method POST --api-version 7.1 --in-file $body --encoding utf-8 -o json
-    $queueExitCode = $LASTEXITCODE
-} finally {
-    Remove-Item -LiteralPath $body
-}
+gh api --hostname <host> --method POST "repos/<owner>/<repo>/check-runs/<checkRunId>/rerequest"
 ```
 
-This is a POST creating a new build, not `PATCH ...?retry=true`. Only retry an existing build or stage when the user specifically wants failed jobs retried on the **same** revision; do not substitute a retry for a fresh-run requirement.
-
-Capture the queue response and its new build ID. Check the exit code, validation errors, `reason`, `sourceBranch`, and `sourceVersion`, then read the new build with `az pipelines build show`. Confirm the new ID differs from the original and the source matches the verified revision. A fast build may already be completed, so pending/running is not the only valid state. Check GitHub for the corresponding pipeline check; do not assume setting `reason` guarantees check publication for every integration.
-
-If the service definitively rejects the request, report the specific error and proceed to step 5. On a timeout or other uncertain write outcome, look for a newly queued matching build before trying again or commenting; otherwise a duplicate run may be created. An accepted build that has not yet published a GitHub check is not grounds for immediately starting another run.
-
-## 5. Fall back to GitHub command comments
-
-Use comments only when the CLI is unavailable/invalid, rejects the fresh-run request, or cannot preserve the required PR context. A fresh run being necessary is **not** by itself a fallback condition. Explain the actual CLI limitation.
-
-Resolve the pipeline's actual definition name from the build or repository configuration; do not blindly strip parentheses from check names. Deduplicate pipeline names, exclude builds already queued successfully through the CLI, and combine remaining pipelines in one comment:
+Use the owning integration's supported trigger check, not an arbitrary job/analysis check. If the integration supports suite-level re-requests instead, and every check in that suite is within scope, request the suite once:
 
 ```powershell
-gh pr comment <pr> --repo <owner>/<repo> --body "/azp run <pipeline-name>[, <pipeline-name>...]"
+gh api --hostname <host> --method POST "repos/<owner>/<repo>/check-suites/<checkSuiteId>/rerequest"
 ```
 
-Use `/azp run` with no pipeline names only when the user wants every Azure Pipelines pipeline on the PR started.
+Never issue both requests for the same pipeline. A suite may include multiple pipelines; do not expand the user's scope just to use a suite request. These are webhook re-requests to the check-owning app, not creation or manual updates of check records. Do not fabricate check runs, mark failures successful, or reconstruct Azure DevOps queue payloads.
 
-The comment is a command: post it without attribution or extra prose. The commenter needs permission to trigger builds. Posting a comment is not proof that a build started. Check for a new build/check and verify its source revision using the same requirements as step 4; report if it has not started or still uses an old revision.
+Check the exit code and HTTP response. An accepted re-request means GitHub accepted the request, not that the provider started a build. Permission or integration restrictions may reject this operation even when repository reads succeed.
 
-## 6. Report
+On a definitive rejection or a provider that does not support the applicable re-request webhook, consider step 5. On a timeout or uncertain write result, inspect checks and provider links before retrying or commenting. If an accepted request has not produced a new build, allow for asynchronous processing and report it as unverified; do not immediately send another trigger.
 
-For each pipeline, report the method (CLI fresh run, explicitly requested same-revision retry, or command fallback), new build link and status, and whether the required fix/revision is included. Distinguish requested, accepted, and verified runs. Include any source-revision blocker or specific reason for fallback; never claim the fix was tested just because a new build ID exists.
+## 5. Use supported command comments only as a fallback
 
-Reference: [Azure DevOps Build Queue API](https://learn.microsoft.com/en-us/rest/api/azure/devops/build/builds/queue?view=azure-devops-rest-7.1).
+For Azure Pipelines, use `/azp run` through `gh` only when direct re-requesting is unsupported, denied, or demonstrably cannot meet the required operation. Explain the specific limitation. The commenter still needs the provider's trigger permission; a REST denial does not prove a comment is permitted.
+
+Resolve the exact pipeline name from repository configuration or provider evidence; do not blindly strip suffixes from check names. Deduplicate names and exclude pipelines already triggered successfully:
+
+```powershell
+gh pr comment <pr> --repo <host>/<owner>/<repo> --body "/azp run <pipeline-name>"
+```
+
+Use a bare `/azp run` only when the user requested all Azure Pipelines pipelines on the PR. Post command comments without attribution or extra prose so the trigger remains intact. Do not treat a successful comment post as successful build creation. Comments cannot fix stale merge refs or guarantee refreshed inputs either.
+
+## 6. Verify and report
+
+Re-read the selected checks using `gh pr checks` and the paginated Checks API. Look for updated attempt timestamps, changed provider build links/IDs, or new check records. A check re-request can reuse GitHub check/suite IDs, and a provider may create a new build ID; neither ID behavior alone proves the correct source was built. A reset to `queued` alone is not proof the provider acted.
+
+Confirm the provider run and its actual revision/inputs from available check output and linked build evidence. A fast run may already be completed. If the required fix is absent, report the source mismatch instead of claiming success. Do not bypass inaccessible provider evidence with assumptions.
+
+Report the pipeline, method (check/suite re-request, Actions rerun, or command fallback), run/check link, current status, and whether the required revision is confirmed. Distinguish requested, accepted, provider-started, and verified. State any permission, source, or verification blocker plainly.
+
+References: [Re-request a check run](https://docs.github.com/en/rest/checks/runs#rerequest-a-check-run), [re-request a check suite](https://docs.github.com/en/rest/checks/suites#rerequest-a-check-suite), and [`gh run rerun`](https://cli.github.com/manual/gh_run_rerun).
